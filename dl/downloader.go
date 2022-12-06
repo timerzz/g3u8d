@@ -79,7 +79,7 @@ func (d *DownLoader) Wait() <-chan struct{} {
 func (d *DownLoader) parse() error {
 	var rc io.ReadCloser
 	defer func() {
-		rc.Close()
+		_ = rc.Close()
 	}()
 	if d.cfg.M3u8Url != "" {
 		resp, err := d.client.R().Get(d.cfg.M3u8Url)
@@ -147,7 +147,11 @@ func (d *DownLoader) Run() (err error) {
 
 	go d.retryRunner()
 
-	go d.merge()
+	go func() {
+		if err := d.merge(); err != nil {
+			logrus.Errorf("merge err:%v", err)
+		}
+	}()
 
 	for _, chunk := range d.chunks {
 		var c = chunk
@@ -167,7 +171,7 @@ func (d *DownLoader) Run() (err error) {
 }
 
 func (d *DownLoader) mkTmp() (err error) {
-	d.tmp = filepath.Join(d.cfg.WorkDr, "tmp")
+	d.tmp = filepath.Join(d.cfg.WorkDr, fmt.Sprintf("%s.tmp", d.cfg.SaveName))
 	if err = os.MkdirAll(d.tmp, 0644); err != nil {
 		return fmt.Errorf("创建临时目录失败:%v", err)
 	}
@@ -182,7 +186,9 @@ func (d *DownLoader) merge() (err error) {
 		return
 	}
 
-	defer d.saveFile.Close()
+	defer func() {
+		_ = d.saveFile.Close()
+	}()
 
 	for _, chunk := range d.chunks {
 		select {
@@ -252,7 +258,9 @@ func (d *DownLoader) downloadChunk(chunk *chunk) error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmpFile.Name())
+	defer func() {
+		_ = os.RemoveAll(tmpFile.Name())
+	}()
 
 	if chunk.status == chunk_status_merged || chunk.status == chunk_status_success {
 		return tmpFile.Close()
@@ -306,7 +314,9 @@ func (d *DownLoader) downloadChunk(chunk *chunk) error {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			defer func() {
+				_ = f.Close()
+			}()
 			_, err = f.Write(b)
 			return err
 		}()
