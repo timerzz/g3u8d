@@ -148,26 +148,21 @@ func (d *DownLoader) Run() (err error) {
 	go d.retryRunner()
 
 	go func() {
-		if err := d.merge(); err != nil {
-			logrus.Errorf("merge err:%v", err)
-		}
-	}()
-
-	for _, chunk := range d.chunks {
-		var c = chunk
-		if d.ctx.Err() == nil {
-			if err := d.pool.Submit(func() {
-				if err = d.downloadChunk(c); err != nil {
-					logrus.Errorf("下载失败！%v", err)
-					d.cancel()
+		for _, chunk := range d.chunks {
+			var c = chunk
+			if d.ctx.Err() == nil {
+				if err := d.pool.Submit(func() {
+					if err = d.downloadChunk(c); err != nil {
+						logrus.Errorf("下载失败！%v", err)
+						d.cancel()
+					}
+				}); err != nil {
+					logrus.Error(err)
 				}
-			}); err != nil {
-				logrus.Error(err)
 			}
 		}
-	}
-	<-d.ctx.Done()
-	return
+	}()
+	return d.merge()
 }
 
 func (d *DownLoader) mkTmp() (err error) {
