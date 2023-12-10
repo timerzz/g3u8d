@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"time"
 )
 
 type DownLoader struct {
@@ -36,10 +35,9 @@ type DownLoader struct {
 
 	downloadSize int64 //每秒钟下载的数量
 
-	total    int64 //总共需要下载的数量
-	complete int64 //完成的下载数量
-
-	retryChannel chan *chunk
+	total     int64 //总共需要下载的数量
+	complete  int64 //完成的下载数量
+	dlChannel chan *chunk
 
 	saveFile *os.File
 }
@@ -79,7 +77,9 @@ func (d *DownLoader) Wait() <-chan struct{} {
 func (d *DownLoader) parse() error {
 	var rc io.ReadCloser
 	defer func() {
-		_ = rc.Close()
+		if rc != nil {
+			_ = rc.Close()
+		}
 	}()
 	if d.cfg.M3u8Url != "" {
 		resp, err := d.client.R().Get(d.cfg.M3u8Url)
@@ -122,6 +122,10 @@ func (d *DownLoader) requestKey() (err error) {
 	return err
 }
 
+func (d *DownLoader) Done() {
+	d.cancel()
+}
+
 func (d *DownLoader) Run() (err error) {
 	if err = d.parse(); err != nil {
 		return
@@ -142,22 +146,19 @@ func (d *DownLoader) Run() (err error) {
 	d.initChunk()
 
 	// 初始化channel
-	d.retryChannel = make(chan *chunk, d.cfg.MaxThread)
-	defer close(d.retryChannel)
+	d.dlChannel = make(chan *chunk, d.cfg.MaxThread)
+	defer close(d.dlChannel)
 
-	go d.retryRunner()
+	go d.download()
 
 	go func() {
 		for _, chunk := range d.chunks {
 			var c = chunk
 			if d.ctx.Err() == nil {
 				if err := d.pool.Submit(func() {
-					if err = d.downloadChunk(c); err != nil {
-						logrus.Errorf("下载失败！%v", err)
-						d.cancel()
-					}
+					d.execute(c)
 				}); err != nil {
-					logrus.Error(err)
+					logrus.Errorf("提交任务失败：%v", err)
 				}
 			}
 		}
@@ -218,16 +219,33 @@ func (d *DownLoader) initChunk() {
 	idx := 0
 	for _, seg := range d.playList.Segments {
 		if seg != nil {
-			chunk := &chunk{
+			c := &chunk{
 				index: idx,
 				url:   seg.URI,
 			}
-			chunk.ctx, chunk.cancel = context.WithCancel(d.ctx)
-			d.chunks = append(d.chunks, chunk)
+			c.ctx, c.cancel = context.WithCancel(d.ctx)
+			d.chunks = append(d.chunks, c)
 			idx++
 		}
 	}
 	d.total = int64(d.playList.Count())
+}
+
+func (d *DownLoader) execute(c *chunk) {
+	err := d.downloadChunk(c)
+	if err != nil {
+		if int(c.retryTimes) < d.cfg.RetryCount {
+			go func() {
+				d.dlChannel <- c
+			}()
+			return
+		}
+		c.retryTimes++
+		c.status = chunk_status_fail
+		c.ctx.Done()
+		logrus.Errorf("chunk %s 下载失败: %v", c.url, err)
+		return
+	}
 }
 
 func (d *DownLoader) downloadChunk(chunk *chunk) error {
@@ -248,41 +266,24 @@ func (d *DownLoader) downloadChunk(chunk *chunk) error {
 		return nil
 	}
 
+	if chunk.status == chunk_status_merged || chunk.status == chunk_status_success {
+		return nil
+	}
+
 	// 创建临时文件
-	tmpFile, err := os.CreateTemp(d.tmp, fmt.Sprintf("%d_*.ts", chunk.index))
+	tmpFile, err := os.CreateTemp(d.tmp, fmt.Sprintf("tmp_*.%d", chunk.index))
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = os.RemoveAll(tmpFile.Name())
-	}()
 
-	if chunk.status == chunk_status_merged || chunk.status == chunk_status_success {
-		return tmpFile.Close()
-	}
-
-	go func() {
-		// 如果超时时间过了还没完成，那就重试
-		timer := time.NewTimer(*d.cfg.Timeout)
-		select {
-		case <-timer.C:
-			atomic.AddInt32(&chunk.retryTimes, 1)
-			d.retryChannel <- chunk
-		case <-chunk.ctx.Done():
-		}
-	}()
+	defer os.RemoveAll(tmpFile.Name())
 
 	_, err = d.client.R().SetOutput(nio.NWriter(tmpFile, func(n int) { d.downloadSize += int64(n) })).Get(chunk.url)
 
 	_ = tmpFile.Close()
 
 	if err != nil {
-		if chunk.retryTimes < int32(d.cfg.RetryCount) {
-			atomic.AddInt32(&chunk.retryTimes, 1)
-			d.retryChannel <- chunk
-		} else {
-			return err
-		}
+		return err
 	}
 
 	// 下载成功了
@@ -294,6 +295,7 @@ func (d *DownLoader) downloadChunk(chunk *chunk) error {
 	}
 
 	chunk.status = chunk_status_success
+	// 解密
 	if d.m3u8key != nil {
 		var b []byte
 		if b, err = os.ReadFile(tmpFile.Name()); err != nil {
@@ -309,9 +311,7 @@ func (d *DownLoader) downloadChunk(chunk *chunk) error {
 			if err != nil {
 				return err
 			}
-			defer func() {
-				_ = f.Close()
-			}()
+			defer f.Close()
 			_, err = f.Write(b)
 			return err
 		}()
@@ -341,25 +341,19 @@ func (d *DownLoader) Progress() (int64, int64) {
 	return d.complete, d.total
 }
 
-func (d *DownLoader) retryRunner() {
+func (d *DownLoader) download() {
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
-		case chunk := <-d.retryChannel:
-			if chunk == nil {
-				if d.ctx.Err() != nil {
-					return
-				}
+		case c := <-d.dlChannel:
+			if c == nil {
 				continue
 			}
 			if err := d.pool.Submit(func() {
-				if err := d.downloadChunk(chunk); err != nil {
-					logrus.Errorf("下载失败！%v", err)
-					d.cancel()
-				}
+				d.execute(c)
 			}); err != nil {
-				logrus.Error(err)
+				logrus.Errorf("提交任务失败：%v", err)
 			}
 		}
 	}

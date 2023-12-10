@@ -6,6 +6,7 @@ import (
 	"github.com/timerzz/g3u8d/pkg/progressbar"
 	"github.com/urfave/cli/v2"
 	"log"
+	"log/slog"
 	"os"
 	"time"
 )
@@ -81,7 +82,12 @@ func main() {
 		},
 		Action: func(context *cli.Context) error {
 			d := dl.New(c)
-			go d.Run()
+			go func() {
+				if err := d.Run(); err != nil {
+					slog.Error(fmt.Sprintf("运行错误:%v", err))
+					d.Done()
+				}
+			}()
 
 			bar := progressbar.New(
 				progressbar.WithInterval(time.Second),
